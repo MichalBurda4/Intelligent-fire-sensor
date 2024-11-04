@@ -1,30 +1,24 @@
-/* WiFi station Example
-
-   This example code is in the Public Domain (or CC0 licensed, at your option.)
-
-   Unless required by applicable law or agreed to in writing, this
-   software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-   CONDITIONS OF ANY KIND, either express or implied.
-*/
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+
+#ifndef portTICK_PERIOD_MS
+#define portTICK_PERIOD_MS (1000 / configTICK_RATE_HZ)
+#endif
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "driver/gpio.h"
+#include "sdkconfig.h"
+#include "esp_rom_gpio.h"
 
 #include "lwip/err.h"
 #include "lwip/sys.h"
+#include <netdb.h>
 
-/* The examples use WiFi configuration that you can set via project configuration menu
-
-   If you'd rather not, just change the below entries to strings with
-   the config you want - ie #define EXAMPLE_WIFI_SSID "mywifissid"
-*/
 #define EXAMPLE_ESP_WIFI_SSID CONFIG_ESP_WIFI_SSID
 #define EXAMPLE_ESP_WIFI_PASS CONFIG_ESP_WIFI_PASSWORD
 #define EXAMPLE_ESP_MAXIMUM_RETRY CONFIG_ESP_MAXIMUM_RETRY
@@ -57,21 +51,105 @@
 #define ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD WIFI_AUTH_WAPI_PSK
 #endif
 
-/* FreeRTOS event group to signal when we are connected*/
 static EventGroupHandle_t s_wifi_event_group;
 
-/* The event group allows multiple bits for each event, but we only care about two events:
- * - we are connected to the AP with an IP
- * - we failed to connect after the maximum amount of retries */
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
-#define LED_PIN 15
+#define LED_PIN 2
+#define WEB_SERVER "example.com"
+#define WEB_PORT "80"
+#define WEB_URL "http://example.com"
 
-static const char *TAG = "wifi station";
+static const char *TAG ="WEB_PAGE_GET";
+TaskHandle_t blink_led_task_handle = NULL;
+TaskHandle_t http_get_task_handle = NULL;
 
-//static int s_retry_num = 0;
+static bool has_been_web_received = false;
 
 static bool Is_connected = false;
+
+void http_get_task(void *pvParameters) {
+    const struct addrinfo hints = {
+        .ai_family = AF_INET,
+        .ai_socktype = SOCK_STREAM,
+    };
+    struct addrinfo *res;
+    struct in_addr *addr;
+    int s, r;
+    char recv_buf[64];
+
+    while(1) {
+        int err = getaddrinfo(WEB_SERVER, WEB_PORT, &hints, &res);
+
+        if(err != 0 || res == NULL) {
+            ESP_LOGE(TAG, "DNS lookup failed err=%d res=%p", err, res);
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
+            continue;
+        }
+
+        addr = &((struct sockaddr_in *)res->ai_addr)->sin_addr;
+        ESP_LOGI(TAG, "DNS lookup succeeded. IP=%s", inet_ntoa(*addr));
+
+        s = socket(res->ai_family, res->ai_socktype, 0);
+        if(s < 0) {
+            ESP_LOGE(TAG, "... Failed to allocate socket.");
+            freeaddrinfo(res);
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
+            continue;
+        }
+        ESP_LOGI(TAG, "... allocated socket");
+
+        if(connect(s, res->ai_addr, res->ai_addrlen) != 0) {
+            ESP_LOGE(TAG, "... socket connect failed errno=%d", errno);
+            close(s);
+            freeaddrinfo(res);
+            vTaskDelay(4000 / portTICK_PERIOD_MS);
+            continue;
+        }
+
+        ESP_LOGI(TAG, "... connected");
+        freeaddrinfo(res);
+
+        const char *request = "GET " WEB_URL " HTTP/1.1\r\n"
+                              "Host: "WEB_SERVER"\r\n"
+                              "User-Agent: esp-idf/1.0 esp32\r\n"
+                              "\r\n";
+
+        if (write(s, request, strlen(request)) < 0) {
+            ESP_LOGE(TAG, "... socket send failed");
+            close(s);
+            vTaskDelay(4000 / portTICK_PERIOD_MS);
+            continue;
+        }
+        ESP_LOGI(TAG, "... socket send success");
+
+        struct timeval receiving_timeout;
+        receiving_timeout.tv_sec = 5;
+        receiving_timeout.tv_usec = 0;
+        if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &receiving_timeout,
+                sizeof(receiving_timeout)) < 0) {
+            ESP_LOGE(TAG, "... failed to set socket receiving timeout");
+            close(s);
+            vTaskDelay(4000 / portTICK_PERIOD_MS);
+            continue;
+        }
+        ESP_LOGI(TAG, "... set socket receiving timeout success");
+
+        do {
+            bzero(recv_buf, sizeof(recv_buf));
+            r = read(s, recv_buf, sizeof(recv_buf)-1);
+            for(int i = 0; i < r; i++) {
+                putchar(recv_buf[i]);
+            }
+        } while(r > 0);
+
+        ESP_LOGI(TAG, "... done reading from socket. Last read return=%d errno=%d.", r, errno);
+        close(s);
+        break;
+    }
+    has_been_web_received = true;
+    vTaskDelete(NULL);
+}
 
 static void event_handler(void* arg, esp_event_base_t event_base,
                                 int32_t event_id, void* event_data)
@@ -79,47 +157,56 @@ static void event_handler(void* arg, esp_event_base_t event_base,
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        
         esp_wifi_connect();
-        //s_retry_num++;
-        ESP_LOGI(TAG, "retry to connect to the AP");
-        // else {
-        //     xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-        // }
         ESP_LOGI(TAG,"connect to the AP fail");
-        Is_connected = false;
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
-        //s_retry_num = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-        Is_connected = true;
     }
 }
 
 void blink_led_task(void *pvParameter) {
     // Inicjalizacja pinu LED jako wyjścia
-    gpio_pad_select_gpio(LED_PIN);
+    esp_rom_gpio_pad_select_gpio(LED_PIN);
     gpio_set_direction(LED_PIN, GPIO_MODE_OUTPUT);
 
-    while (1) {
-        if (!Is_connected) {
-            // Miga, gdy brak połączenia
-            gpio_set_level(LED_PIN, 1); // Włącz diodę
+    while(1) {   
+            gpio_set_level(LED_PIN, 1);
             ESP_LOGI(TAG, "LED ON");
-            vTaskDelay(500 / portTICK_PERIOD_MS); // Czekaj 500 ms
-            gpio_set_level(LED_PIN, 0); // Wyłącz diodę
-            ESP_LOGI(TAG, "LED OFF");
-            vTaskDelay(500 / portTICK_PERIOD_MS); // Czekaj 500 ms
-        } else {
-            // Wyłącza LED, gdy jest połączony
+            vTaskDelay(500 / portTICK_PERIOD_MS);
             gpio_set_level(LED_PIN, 0);
-            ESP_LOGI(TAG, "LED OFF (connected)");
-            vTaskDelay(1000 / portTICK_PERIOD_MS); // Czekaj 1000 ms
-        }
+            ESP_LOGI(TAG, "LED OFF");
+            vTaskDelay(500 / portTICK_PERIOD_MS);
     }
-    // Zakończenie taska (opcjonalne, ale dobry nawyk)
+    // Zakończenie taska
     vTaskDelete(NULL);
+}
+
+void check_connection(void *pvParameter) {
+    wifi_ap_record_t ap_info;
+    while(1) {
+        if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) {
+            ESP_LOGI(TAG, "Brak połączenia");
+            Is_connected = false;
+            if (blink_led_task_handle == NULL) {
+                xTaskCreate(&blink_led_task, "blink_led_task", 2048, NULL, 5, &blink_led_task_handle);
+            }
+        } else {
+            ESP_LOGI(TAG, "Połączono z %s", ap_info.ssid);
+            Is_connected = true;
+            if(has_been_web_received == false && http_get_task_handle == NULL) {
+                xTaskCreate(&http_get_task, "http_get_task", 4096, NULL, 5, &http_get_task_handle);
+            }
+
+            if (blink_led_task_handle != NULL) {
+                vTaskDelete(blink_led_task_handle);
+                gpio_set_level(LED_PIN, 0);
+                blink_led_task_handle = NULL;
+            }
+        }
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+    }
 }
 
 void wifi_init_sta(void)
@@ -151,11 +238,6 @@ void wifi_init_sta(void)
         .sta = {
             .ssid = EXAMPLE_ESP_WIFI_SSID,
             .password = EXAMPLE_ESP_WIFI_PASS,
-            /* Authmode threshold resets to WPA2 as default if password matches WPA2 standards (password len => 8).
-             * If you want to connect the device to deprecated WEP/WPA networks, Please set the threshold value
-             * to WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK and set the password with length and format matching to
-             * WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK standards.
-             */
             .threshold.authmode = ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD,
             .sae_pwe_h2e = ESP_WIFI_SAE_MODE,
             .sae_h2e_identifier = EXAMPLE_H2E_IDENTIFIER,
@@ -167,16 +249,12 @@ void wifi_init_sta(void)
 
     ESP_LOGI(TAG, "wifi_init_sta finished.");
 
-    /* Waiting until either the connection is established (WIFI_CONNECTED_BIT) or connection failed for the maximum
-     * number of re-tries (WIFI_FAIL_BIT). The bits are set by event_handler() (see above) */
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
             WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
             pdFALSE,
             pdFALSE,
             portMAX_DELAY);
 
-    /* xEventGroupWaitBits() returns the bits before the call returned, hence we can test which event actually
-     * happened. */
     if (bits & WIFI_CONNECTED_BIT) {
         ESP_LOGI(TAG, "connected to ap SSID:%s password:%s",
                  EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS);
@@ -190,8 +268,6 @@ void wifi_init_sta(void)
 
 void app_main(void)
 {
-    
-    //Initialize NVS
     nvs_flash_erase();
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -200,8 +276,7 @@ void app_main(void)
     }
     
     ESP_ERROR_CHECK(ret);
-
+    xTaskCreate(&check_connection, "check_connection", 2048, NULL, 5, NULL);
     ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
     wifi_init_sta();
-    xTaskCreate(&blink_led_task, "blink_led_task", 2048, NULL, 5, NULL);
 }
