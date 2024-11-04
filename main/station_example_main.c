@@ -51,6 +51,7 @@
 #define ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD WIFI_AUTH_WAPI_PSK
 #endif
 
+//Obsługuje zdarzenia wifi
 static EventGroupHandle_t s_wifi_event_group;
 
 #define WIFI_CONNECTED_BIT BIT0
@@ -61,6 +62,7 @@ static EventGroupHandle_t s_wifi_event_group;
 #define WEB_URL "http://example.com"
 
 static const char *TAG ="WEB_PAGE_GET";
+
 TaskHandle_t blink_led_task_handle = NULL;
 TaskHandle_t http_get_task_handle = NULL;
 
@@ -68,18 +70,19 @@ static bool has_been_web_received = false;
 
 static bool Is_connected = false;
 
+//Pobiera zawartość strony
 void http_get_task(void *pvParameters) {
-    const struct addrinfo hints = {
-        .ai_family = AF_INET,
-        .ai_socktype = SOCK_STREAM,
+    const struct addrinfo hints = { //wskazowki dotyczące typy połączenia
+        .ai_family = AF_INET, //protokol IPv4
+        .ai_socktype = SOCK_STREAM, //TCP
     };
-    struct addrinfo *res;
-    struct in_addr *addr;
-    int s, r;
-    char recv_buf[64];
+    struct addrinfo *res; //informację o adresie 
+    struct in_addr *addr; //adres ip
+    int s, r; // s-socket, r-wynik read
+    char recv_buf[64]; //bufor na dane z serwera
 
     while(1) {
-        int err = getaddrinfo(WEB_SERVER, WEB_PORT, &hints, &res);
+        int err = getaddrinfo(WEB_SERVER, WEB_PORT, &hints, &res); //proba uzyskania adresu ip zadanego serwera
 
         if(err != 0 || res == NULL) {
             ESP_LOGE(TAG, "DNS lookup failed err=%d res=%p", err, res);
@@ -87,10 +90,10 @@ void http_get_task(void *pvParameters) {
             continue;
         }
 
-        addr = &((struct sockaddr_in *)res->ai_addr)->sin_addr;
+        addr = &((struct sockaddr_in *)res->ai_addr)->sin_addr; //przypisanie adresu ip
         ESP_LOGI(TAG, "DNS lookup succeeded. IP=%s", inet_ntoa(*addr));
 
-        s = socket(res->ai_family, res->ai_socktype, 0);
+        s = socket(res->ai_family, res->ai_socktype, 0); //utworzenie gniazda
         if(s < 0) {
             ESP_LOGE(TAG, "... Failed to allocate socket.");
             freeaddrinfo(res);
@@ -99,7 +102,7 @@ void http_get_task(void *pvParameters) {
         }
         ESP_LOGI(TAG, "... allocated socket");
 
-        if(connect(s, res->ai_addr, res->ai_addrlen) != 0) {
+        if(connect(s, res->ai_addr, res->ai_addrlen) != 0) { //proba nawiązania połączenia
             ESP_LOGE(TAG, "... socket connect failed errno=%d", errno);
             close(s);
             freeaddrinfo(res);
@@ -113,9 +116,9 @@ void http_get_task(void *pvParameters) {
         const char *request = "GET " WEB_URL " HTTP/1.1\r\n"
                               "Host: "WEB_SERVER"\r\n"
                               "User-Agent: esp-idf/1.0 esp32\r\n"
-                              "\r\n";
+                              "\r\n"; //przygotowania requesta http
 
-        if (write(s, request, strlen(request)) < 0) {
+        if (write(s, request, strlen(request)) < 0) { //wysłanie requesta
             ESP_LOGE(TAG, "... socket send failed");
             close(s);
             vTaskDelay(4000 / portTICK_PERIOD_MS);
@@ -123,7 +126,7 @@ void http_get_task(void *pvParameters) {
         }
         ESP_LOGI(TAG, "... socket send success");
 
-        struct timeval receiving_timeout;
+        struct timeval receiving_timeout; //czas oczekiwania na odpowiedź
         receiving_timeout.tv_sec = 5;
         receiving_timeout.tv_usec = 0;
         if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &receiving_timeout,
@@ -135,7 +138,7 @@ void http_get_task(void *pvParameters) {
         }
         ESP_LOGI(TAG, "... set socket receiving timeout success");
 
-        do {
+        do { //zapisanie odpowiedzi do bufora
             bzero(recv_buf, sizeof(recv_buf));
             r = read(s, recv_buf, sizeof(recv_buf)-1);
             for(int i = 0; i < r; i++) {
@@ -151,6 +154,7 @@ void http_get_task(void *pvParameters) {
     vTaskDelete(NULL);
 }
 
+//obsługa zdarzeń łączenia do wifi
 static void event_handler(void* arg, esp_event_base_t event_base,
                                 int32_t event_id, void* event_data)
 {
@@ -183,23 +187,24 @@ void blink_led_task(void *pvParameter) {
     vTaskDelete(NULL);
 }
 
+//sprawdza stan połączenia
 void check_connection(void *pvParameter) {
     wifi_ap_record_t ap_info;
     while(1) {
-        if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) {
+        if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) { //nie ma połączenie
             ESP_LOGI(TAG, "Brak połączenia");
             Is_connected = false;
-            if (blink_led_task_handle == NULL) {
+            if (blink_led_task_handle == NULL) { //aktywacja diody
                 xTaskCreate(&blink_led_task, "blink_led_task", 2048, NULL, 5, &blink_led_task_handle);
             }
-        } else {
+        } else { //jest połączenie
             ESP_LOGI(TAG, "Połączono z %s", ap_info.ssid);
             Is_connected = true;
-            if(has_been_web_received == false && http_get_task_handle == NULL) {
+            if(has_been_web_received == false && http_get_task_handle == NULL) { //inicjalizacja zadania pobrania strony
                 xTaskCreate(&http_get_task, "http_get_task", 4096, NULL, 5, &http_get_task_handle);
             }
 
-            if (blink_led_task_handle != NULL) {
+            if (blink_led_task_handle != NULL) { //wyłączenie diody
                 vTaskDelete(blink_led_task_handle);
                 gpio_set_level(LED_PIN, 0);
                 blink_led_task_handle = NULL;
@@ -213,10 +218,10 @@ void wifi_init_sta(void)
 {
     s_wifi_event_group = xEventGroupCreate();
 
-    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_netif_init()); //inicjalizacja interfejsu wifi
 
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
+    esp_netif_create_default_wifi_sta(); //wifi tryb station
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -234,7 +239,7 @@ void wifi_init_sta(void)
                                                         NULL,
                                                         &instance_got_ip));
 
-    wifi_config_t wifi_config = {
+    wifi_config_t wifi_config = { //konfiguracja wifi
         .sta = {
             .ssid = EXAMPLE_ESP_WIFI_SSID,
             .password = EXAMPLE_ESP_WIFI_PASS,
@@ -249,7 +254,7 @@ void wifi_init_sta(void)
 
     ESP_LOGI(TAG, "wifi_init_sta finished.");
 
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, //oczekiwanie na powodzenie lub błąd
             WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
             pdFALSE,
             pdFALSE,
